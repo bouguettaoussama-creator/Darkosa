@@ -1294,3 +1294,348 @@ async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "regen":
             if len(history) < 2 or history[-1]["role"] != "assistant":
                 await callback_query.answer("❌ لا يوجد رد لإعادة توليده.", show_alert=True)
+                return
+            history.pop()  # حذف آخر رد للمساعد
+            messages = build_messages(user, history)
+            new_reply = await stream_ai_reply(callback_query.message, messages, model)
+            history.append({"role": "assistant", "content": new_reply})
+            conv["history"] = history[-MAX_HISTORY:]
+            await save_user(update.effective_user.id, user)
+            await safe_edit(callback_query.message, new_reply, reply_markup=action_keyboard(conv_id))
+
+        elif action in ("sum", "exp"):
+            if history and history[-1]["role"] == "assistant":
+                source_text = history[-1]["content"]
+            else:
+                source_text = callback_query.message.text or ""
+
+            if action == "sum":
+                sys_msg = "لخص النص التالي بالعربية بإيجاز ووضوح، مع المحافظة على النقاط الأساسية فقط."
+            else:
+                sys_msg = "وسّع النص التالي وأضف تفاصيل وأمثلة وشرحاً أعمق بالعربية، مع المحافظة على نفس الموضوع."
+
+            messages = [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": source_text},
+            ]
+            label = "✂️ ملخص:" if action == "sum" else "📖 نص موسّع:"
+            status_msg = await callback_query.message.reply_text(f"{label}\n\n⏳")
+            result = await stream_ai_reply(status_msg, messages, model, prefix=f"{label}\n\n")
+            await safe_edit(status_msg, f"{label}\n\n{result}")
+
+        else:
+            await callback_query.answer("❌ إجراء غير معروف.", show_alert=True)
+
+    except Exception as e:
+        logger.error("action error: %s", e)
+        await callback_query.answer("❌ حدث خطأ، حاول مرة أخرى.", show_alert=True)
+
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "🔍 استخدم: /search <كلمات البحث>\n\n"
+            "مثال: /search من ربح كأس أفريقيا 2025"
+        )
+        return
+    user_query = parts[1].strip()
+    status = await update.message.reply_text(f"🔍 جاري البحث عن: {user_query} ...")
+    user = get_user(update.effective_user.id)
+    model = user.get("model", DEFAULT_MODEL)
+    if model not in get_available_models():
+        model = DEFAULT_MODEL
+    smart_query = await prepare_search_query(user_query, model)
+    logger.info("search: '%s' → '%s'", user_query, smart_query)
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(None, lambda: web_search(smart_query, max_results=6))
+    summary_messages = [
+        {
+            "role": "system",
+            "content": (
+                "أنت مساعد يلخص نتائج البحث بشكل واضح ومفيد بالعربية. "
+                "قيّم النتائج بعقل نقدي — إذا بدت متناقضة أو غير موثوقة فنبّه المستخدم. "
+                "اذكر دائماً إن كانت المعلومة موثوقة أم تحتاج تحقق."
+            ),
+        },
+        {"role": "user", "content": f"لخّص هذه النتائج للسؤال «{user_query}»:\n\n{results}"},
+    ]
+    prefix = f"🔍 **نتائج البحث عن:** {user_query}\n\n"
+    summary = await stream_ai_reply(status, summary_messages, model, prefix=prefix)
+    final = prefix + (summary or results)
+    await safe_edit(status, final)
+
+
+async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    headlines = _NEWS_CACHE.get("headlines", [])
+    updated = _NEWS_CACHE.get("updated_at", "")
+    if not headlines:
+        status = await update.message.reply_text("🗞️ جاري جلب الأخبار للمرة الأولى...")
+        loop = asyncio.get_event_loop()
+        headlines = await loop.run_in_executor(None, _fetch_news)
+        _NEWS_CACHE["headlines"] = headlines
+        _NEWS_CACHE["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        updated = _NEWS_CACHE["updated_at"]
+        await status.delete()
+    if not headlines:
+        await update.message.reply_text("⚠️ لم أتمكن من جلب الأخبار حالياً، حاول لاحقاً.")
+        return
+    text = f"🗞️ **آخر الأخبار** (محدّثة {updated}):\n\n" + "\n\n".join(headlines[:10])
+    await safe_reply(update.message, text)
+
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = await update.message.reply_text("⏳ جاري المعالجة...")
+    user = get_user(update.effective_user.id)
+    model = user.get("model", DEFAULT_MODEL)
+    if model not in get_available_models():
+        model = DEFAULT_MODEL
+        user["model"] = model
+
+    conv_id = user.get("active")
+    if conv_id is None or conv_id not in user["conversations"]:
+        title = generate_title(update.message.text, model)
+        conv_id = create_conversation(user, title)
+
+    conv = user["conversations"][conv_id]
+    history = conv.get("history", [])
+
+    try:
+        loop = asyncio.get_event_loop()
+        user_text = update.message.text
+
+        # ─── بحث تلقائي ذكي ───
+        search_context = ""
+        if needs_web_search(user_text):
+            await status.edit_text("🔍 جاري البحث في النت...")
+            smart_query = await prepare_search_query(user_text, model)
+            logger.info("auto-search: '%s' → '%s'", user_text[:50], smart_query)
+            search_results = await loop.run_in_executor(None, lambda: web_search(smart_query, max_results=6))
+            if search_results and "⚠️" not in search_results:
+                search_context = (
+                    f"\n\n[نتائج بحث حديثة من النت — قيّمها بعقل نقدي ولا تقبلها عمياً، "
+                    f"إذا بدت متناقضة أو غير موثوقة نبّه المستخدم]:\n{search_results}\n"
+                )
+            await status.edit_text("⏳ جاري المعالجة...")
+
+        final_input = user_text + search_context if search_context else user_text
+        messages = build_messages(user, history, final_input)
+        stream_prefix = "🔍 *بحثت في النت لك:*\n\n" if search_context else ""
+        reply = await stream_ai_reply(status, messages, model, prefix=stream_prefix)
+        reply = stream_prefix + reply
+
+        history.append({"role": "user",      "content": user_text})
+        history.append({"role": "assistant", "content": reply})
+        if len(history) > MAX_HISTORY:
+            history = history[-MAX_HISTORY:]
+        conv["history"] = history
+        await save_user(update.effective_user.id, user)
+
+        await safe_edit(status, reply, reply_markup=action_keyboard(conv_id))
+    except Exception as e:
+        logger.error("AI error: %s", e)
+        await status.edit_text("❌ حدث خطأ، يرجى المحاولة لاحقاً.")
+
+
+# ─── بوابة التحقق: تمنع استخدام البوت قبل إتمام شرط دعوة الأصدقاء ───
+async def verification_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    يعمل قبل أي معالج آخر (group=-1) على كل رسالة خاصة. إذا لم يكن المستخدم
+    متحققاً (أو أدمن)، يعرض له شرط الدعوة ويوقف تمرير التحديث لبقية المعالجات.
+    يستثني /start و/invite لأنهما وسيلة المستخدم لمعرفة حالته ورابطه.
+    """
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if is_verified(user.id):
+        return
+
+    text = msg.text or ""
+    if text.startswith("/start") or text.startswith("/invite"):
+        return
+
+    link = await get_or_create_invite_link(context, user.id)
+    count = get_user(user.id).get("invited_count", 0)
+    try:
+        await msg.reply_text(
+            build_gate_text(user.first_name, link, count),
+            reply_markup=verify_progress_keyboard(),
+        )
+    except Exception:
+        pass
+    raise ApplicationHandlerStop
+
+
+async def verification_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نسخة البوابة الخاصة بأزرار الـ callback (لا تمرّ عبر verification_gate)."""
+    cq = update.callback_query
+    user = update.effective_user
+    if not cq or not user:
+        return
+    if cq.data == "verify:check":
+        return  # يُعالج بواسطة verify_check_callback بشكل طبيعي
+    if is_verified(user.id):
+        return
+    await cq.answer("🔒 البوت مقفل، استخدم /start لمعرفة شرط الفتح.", show_alert=True)
+    raise ApplicationHandlerStop
+
+
+async def verify_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """زر '🔄 تحقق الآن' — يعيد فحص تقدّم المستخدم فوراً."""
+    cq = update.callback_query
+    user = update.effective_user
+    user_id = user.id
+
+    if is_verified(user_id):
+        await cq.answer("✅ أنت متحقق بالفعل، البوت مفتوح لك!", show_alert=True)
+        try:
+            await cq.edit_message_text(f"مرحباً {user.first_name}! 👋\n\n" + HELP_TEXT)
+        except Exception:
+            pass
+        return
+
+    count = get_user(user_id).get("invited_count", 0)
+    remaining = max(0, REQUIRED_INVITES - count)
+    if remaining <= 0:
+        u = get_user(user_id)
+        u["verified"] = True
+        await save_user(user_id, u)
+        await cq.answer("🎉 تم التحقق! البوت مفتوح الآن.", show_alert=True)
+        try:
+            await cq.edit_message_text(f"مرحباً {user.first_name}! 👋\n\n" + HELP_TEXT)
+        except Exception:
+            pass
+        return
+
+    await cq.answer(f"لسه باقي {remaining} من أصل {REQUIRED_INVITES}. حاول تاني بعد ما يكملوا الانضمام.", show_alert=True)
+    link = await get_or_create_invite_link(context, user_id)
+    try:
+        await cq.edit_message_text(
+            build_gate_text(user.first_name, link, count),
+            reply_markup=verify_progress_keyboard(),
+        )
+    except Exception:
+        pass
+
+
+async def track_channel_joins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    يُستدعى تلقائياً من تيليجرام عند تغيّر حالة أي عضو في القناة (chat_member update).
+    هذا هو مصدر التحقق الحقيقي الوحيد: يقارن رابط الدعوة الذي استُخدم للانضمام
+    بالروابط المولَّدة لكل مستخدم، ويحتسب الانضمام فقط إذا كان فعلياً وعبر رابط معروف.
+    """
+    cm = update.chat_member
+    if not cm or not CHANNEL_ID:
+        return
+
+    chat = cm.chat
+    channel_matches = str(chat.id) == str(CHANNEL_ID) or (
+        chat.username and f"@{chat.username}".lower() == str(CHANNEL_ID).lower()
+    )
+    if not channel_matches:
+        return
+
+    old_status = cm.old_chat_member.status
+    new_status = cm.new_chat_member.status
+    joined = old_status in ("left", "kicked", "restricted") and new_status in (
+        "member", "administrator", "creator",
+    )
+    if not joined:
+        return
+
+    invite_link_obj = cm.invite_link
+    if not invite_link_obj:
+        return  # انضم بدون رابط دعوة (مثلاً بحث مباشر) — لا يُحتسب لأحد
+
+    link_url = invite_link_obj.invite_link
+    joined_user_id = cm.new_chat_member.user.id
+
+    newly_verified = False
+    referrer_id = None
+    async with _data_lock:
+        raw_referrer = _DATA.get("_invite_links", {}).get(link_url)
+        if raw_referrer is not None and int(raw_referrer) != joined_user_id:
+            referrer_id = int(raw_referrer)
+            ref_user = _DATA.setdefault(str(referrer_id), {})
+            invited_ids = ref_user.setdefault("invited_user_ids", [])
+            if joined_user_id not in invited_ids:
+                invited_ids.append(joined_user_id)
+                ref_user["invited_count"] = len(invited_ids)
+                if ref_user["invited_count"] >= REQUIRED_INVITES and not ref_user.get("verified"):
+                    ref_user["verified"] = True
+                    newly_verified = True
+                _save_data(_DATA)
+
+    if newly_verified and referrer_id:
+        try:
+            await context.bot.send_message(
+                referrer_id,
+                "🎉 تهانينا! أكملت شرط دعوة الأصدقاء وتم فتح البوت لك بالكامل.\nأرسل أي رسالة للبدء 🚀",
+            )
+        except Exception:
+            pass
+
+
+# ─── الإقلاع ───
+async def post_init(application: Application):
+    logger.info("🚀 البوت جاهز.")
+    loop = asyncio.get_event_loop()
+    headlines = await loop.run_in_executor(None, _fetch_news)
+    if headlines:
+        _NEWS_CACHE["headlines"] = headlines
+        _NEWS_CACHE["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        logger.info("🗞️ تم جلب %d خبر عند الإقلاع", len(headlines))
+    asyncio.create_task(_news_update_loop())
+
+
+def main():
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    private = filters.ChatType.PRIVATE
+
+    # ─── بوابة التحقق: يجب تسجيلها أولاً (group=-1) لتعمل قبل أي معالج آخر ───
+    application.add_handler(MessageHandler(filters.ChatType.PRIVATE, verification_gate), group=-1)
+    application.add_handler(CallbackQueryHandler(verification_gate_callback), group=-1)
+    application.add_handler(ChatMemberHandler(track_channel_joins, ChatMemberHandler.CHAT_MEMBER))
+    application.add_handler(CallbackQueryHandler(verify_check_callback, pattern=r"^verify:check$"))
+
+    application.add_handler(CommandHandler("start", start, filters=private))
+    application.add_handler(CommandHandler("invite", invite_cmd, filters=private))
+    application.add_handler(CommandHandler("help", help_cmd, filters=private))
+    application.add_handler(CommandHandler("new", new_chat, filters=private))
+    application.add_handler(CommandHandler("chats", chats_cmd, filters=private))
+    application.add_handler(CommandHandler("remember", remember_cmd, filters=private))
+    application.add_handler(CommandHandler("notes", notes_cmd, filters=private))
+    application.add_handler(CommandHandler("forget", forget_cmd, filters=private))
+    application.add_handler(CommandHandler("forgetall", forgetall_cmd, filters=private))
+    application.add_handler(CommandHandler("persona", persona_cmd, filters=private))
+    application.add_handler(CommandHandler("mypersona", mypersona_cmd, filters=private))
+    application.add_handler(CommandHandler("setprompt", setprompt_cmd, filters=private))
+    application.add_handler(CommandHandler("myprompt", myprompt_cmd, filters=private))
+    application.add_handler(CommandHandler("resetprompt", resetprompt_cmd, filters=private))
+    application.add_handler(CommandHandler("codemode", codemode_cmd, filters=private))
+    application.add_handler(CommandHandler("filemode", filemode_cmd, filters=private))
+    application.add_handler(CommandHandler("model", model_cmd, filters=private))
+    application.add_handler(CommandHandler("mymodel", mymodel_cmd, filters=private))
+    application.add_handler(CommandHandler("models", models_cmd, filters=private))
+    application.add_handler(CommandHandler("search", search_cmd, filters=private))
+    application.add_handler(CommandHandler("news", news_cmd, filters=private))
+
+    application.add_handler(CallbackQueryHandler(chat_select_callback, pattern=r"^chat:sel:"))
+    application.add_handler(CallbackQueryHandler(chat_delete_callback, pattern=r"^chat:del:"))
+    application.add_handler(CallbackQueryHandler(persona_callback, pattern=r"^persona:"))
+    application.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
+    application.add_handler(CallbackQueryHandler(action_callback, pattern=r"^act:"))
+
+    application.add_handler(MessageHandler(filters.Document.ALL & private, read_file_or_image))
+    application.add_handler(MessageHandler(filters.PHOTO & private, read_file_or_image))
+    application.add_handler(MessageHandler(filters.TEXT & private & ~filters.COMMAND, echo))
+
+    logger.info("🚀 جاري تشغيل البوت...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
+
